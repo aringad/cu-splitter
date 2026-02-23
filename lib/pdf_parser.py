@@ -215,10 +215,11 @@ def _extract_nome_cognome(text: str) -> tuple[str, str]:
 
     # Rimuovi valori che sono chiaramente label e non nomi
     label_words = {"COGNOME", "NOME", "DENOMINAZIONE", "CODICE", "FISCALE",
-                   "SESSO", "DATA", "COMUNE", "PROVINCIA", "FIRMA"}
-    if cognome.upper() in label_words:
+                   "SESSO", "DATA", "COMUNE", "PROVINCIA", "FIRMA",
+                   "O DENOMINAZIONE", "CERTIFICAZIONE", "UNICA"}
+    if cognome.upper().strip() in label_words:
         cognome = ""
-    if nome.upper() in label_words:
+    if nome.upper().strip() in label_words:
         nome = ""
 
     return cognome.upper().strip(), nome.upper().strip()
@@ -227,6 +228,11 @@ def _extract_nome_cognome(text: str) -> tuple[str, str]:
 def parse_pdf(pdf_bytes: bytes) -> list[CURecord]:
     """
     Analizza un PDF massivo e restituisce la lista delle CU trovate.
+
+    Ogni CU può essere composta da più sezioni nel PDF (es. frontespizio +
+    dati fiscali), ognuna con l'intestazione "CERTIFICAZIONE UNICA".
+    Le sezioni consecutive con lo stesso codice fiscale del percipiente
+    vengono unite in un'unica CU.
 
     Args:
         pdf_bytes: contenuto del PDF come bytes
@@ -241,34 +247,56 @@ def parse_pdf(pdf_bytes: bytes) -> list[CURecord]:
         doc.close()
         return []
 
-    records = []
+    # Fase 1: costruisci i segmenti grezzi
+    raw_segments = []
     for i, (start_page, anno) in enumerate(boundaries):
-        # La CU finisce alla pagina prima dell'inizio della prossima,
-        # o all'ultima pagina del documento
         if i + 1 < len(boundaries):
             end_page = boundaries[i + 1][0] - 1
         else:
             end_page = len(doc) - 1
 
-        # Estrai testo completo della CU
         full_text = ""
         for page_idx in range(start_page, end_page + 1):
             full_text += doc[page_idx].get_text("text") + "\n"
 
         cf = _extract_percipiente_cf(full_text)
-        cognome, nome = _extract_nome_cognome(full_text)
 
-        record = CURecord(
+        raw_segments.append({
+            "start_page": start_page,
+            "end_page": end_page,
+            "anno": anno,
+            "cf": cf,
+            "text": full_text,
+        })
+
+    # Fase 2: mergia segmenti consecutivi con lo stesso CF percipiente
+    # (es. frontespizio + dati lavoro dipendente = stessa CU)
+    merged = []
+    for seg in raw_segments:
+        if (merged
+                and seg["cf"]
+                and merged[-1]["cf"] == seg["cf"]):
+            # Stesso percipiente → estendi il segmento precedente
+            merged[-1]["end_page"] = seg["end_page"]
+            merged[-1]["text"] += seg["text"]
+        else:
+            merged.append(dict(seg))
+
+    # Fase 3: estrai nome/cognome dal testo combinato
+    records = []
+    for i, m in enumerate(merged):
+        cognome, nome = _extract_nome_cognome(m["text"])
+
+        records.append(CURecord(
             index=i + 1,
-            start_page=start_page,
-            end_page=end_page,
-            anno=anno,
-            codice_fiscale=cf,
+            start_page=m["start_page"],
+            end_page=m["end_page"],
+            anno=m["anno"],
+            codice_fiscale=m["cf"],
             cognome=cognome,
             nome=nome,
-            raw_text=full_text,
-        )
-        records.append(record)
+            raw_text=m["text"],
+        ))
 
     doc.close()
     return records
