@@ -14,10 +14,17 @@ from dataclasses import dataclass, field
 import fitz  # PyMuPDF
 
 
-# Pattern per identificare l'inizio di una nuova CU
-CU_START_PATTERN = re.compile(
-    r"CERTIFICAZIONE\s+UNICA\s+(\d{4})", re.IGNORECASE
-)
+# Pattern per identificare l'inizio di una nuova CU.
+# Gestisce vari formati di estrazione testo:
+#   - "CERTIFICAZIONE UNICA 2025"        (standard con spazi)
+#   - "CERTIFICAZIONE\nUNICA2025"         (a capo, anno attaccato)
+#   - "CERTIFICAZIONE UNICA\n2025"        (anno su riga separata)
+#   - "CERTIFICAZIONE\nUNICA\n2025"       (tutto separato)
+#   - "C E R T I F I C A Z I O N E ..."   (lettere spaziate)
+CU_START_PATTERNS = [
+    re.compile(r"CERTIFICAZIONE\s+UNICA\s*(\d{4})", re.IGNORECASE),
+    re.compile(r"C\s*E\s*R\s*T\s*I\s*F\s*I\s*C\s*A\s*Z\s*I\s*O\s*N\s*E\s+U\s*N\s*I\s*C\s*A\s*(\d{4})", re.IGNORECASE),
+]
 
 # Codice fiscale italiano: 6 lettere + 2 cifre + 1 lettera + 2 cifre + 1 lettera + 3 cifre + 1 lettera
 CF_PATTERN = re.compile(r"\b([A-Z]{6}\d{2}[A-Z]\d{2}[A-Z]\d{3}[A-Z])\b")
@@ -27,12 +34,13 @@ PERCIPIENTE_SECTION_PATTERNS = [
     re.compile(r"DATI\s+RELATIVI\s+AL\s+DIPENDENTE", re.IGNORECASE),
     re.compile(r"DATI\s+ANAGRAFICI\s+DEL\s+PERCIPIENTE", re.IGNORECASE),
     re.compile(r"DATI\s+RELATIVI\s+AL\s+PERCIPIENTE", re.IGNORECASE),
+    re.compile(r"DATI\s+RELATIVI\s+AL\s+DIPENDENTE,?\s*\n?\s*PENSIONATO", re.IGNORECASE),
     re.compile(r"DATI\s+ANAGRAFICI", re.IGNORECASE),
 ]
 
 # Pattern per cognome e nome nella sezione percipiente
-COGNOME_PATTERN = re.compile(r"Cognome\s+o\s+Denominazione\s*[:\s]*([A-Z\s'À-Ú]+)", re.IGNORECASE)
-NOME_PATTERN = re.compile(r"(?<!\bCognome\b\s{0,5})Nome\s*[:\s]*([A-Z\s'À-Ú]+)", re.IGNORECASE)
+COGNOME_PATTERN = re.compile(r"Cognome\s+o\s+Denominazione\s*[:\s]*([A-Z\s'À-Ú\-]+)", re.IGNORECASE)
+NOME_PATTERN = re.compile(r"(?<![Cc]ognome\s)Nome\s*[:\s]*([A-Z\s'À-Ú\-]+)", re.IGNORECASE)
 
 
 @dataclass
@@ -60,22 +68,49 @@ def _find_cu_boundaries(doc: fitz.Document) -> list[tuple[int, str]]:
     """
     Scansiona ogni pagina e trova dove inizia una nuova CU.
     Restituisce lista di (page_index, anno).
+
+    Usa multiple strategie:
+      1. Cerca il pattern "CERTIFICAZIONE UNICA <anno>" nel testo
+      2. Cerca anche la dicitura con lettere spaziate
+      3. Non filtra per posizione nel testo perché PyMuPDF può estrarre
+         le label dei campi del form prima dell'intestazione
+      4. Evita duplicati sulla stessa pagina
     """
     boundaries = []
+    seen_pages: set[int] = set()
+
     for page_idx in range(len(doc)):
+        if page_idx in seen_pages:
+            continue
+
         page = doc[page_idx]
         text = page.get_text("text")
-        match = CU_START_PATTERN.search(text)
-        if match:
-            # Verifica che sia davvero l'inizio (prima pagina della CU)
-            # e non un riferimento a "CERTIFICAZIONE UNICA" dentro il testo
-            # L'inizio è tipicamente nella parte alta della pagina
-            anno = match.group(1)
-            # Controlla posizione verticale del match nel testo
-            # Se "CERTIFICAZIONE UNICA" appare nei primi 1/3 del testo, è un header
-            match_pos = match.start()
-            if match_pos < len(text) * 0.5:
+
+        # Prova tutti i pattern
+        found = False
+        for pattern in CU_START_PATTERNS:
+            match = pattern.search(text)
+            if match:
+                anno = match.group(1)
                 boundaries.append((page_idx, anno))
+                seen_pages.add(page_idx)
+                found = True
+                break
+
+        # Fallback: cerca "CERTIFICAZIONE" su una riga e "UNICA" + anno
+        # nelle righe successive (testo molto frammentato)
+        if not found:
+            lines = text.split("\n")
+            for i, line in enumerate(lines):
+                if re.search(r"CERTIFICAZIONE", line, re.IGNORECASE):
+                    # Cerca "UNICA" e un anno nelle righe successive (max 3)
+                    remaining = " ".join(lines[i:i+4])
+                    m = re.search(r"CERTIFICAZIONE\s+UNICA\s*(\d{4})", remaining, re.IGNORECASE)
+                    if m and page_idx not in seen_pages:
+                        boundaries.append((page_idx, m.group(1)))
+                        seen_pages.add(page_idx)
+                        break
+
     return boundaries
 
 
@@ -108,12 +143,12 @@ def _extract_percipiente_cf(text: str) -> str:
 def _extract_nome_cognome(text: str) -> tuple[str, str]:
     """
     Estrae cognome e nome del percipiente dal testo della CU.
-    Cerca nella sezione dati del percipiente.
+    Usa multiple strategie per gestire diversi formati PDF.
     """
     cognome = ""
     nome = ""
 
-    # Trova la sezione del percipiente
+    # --- Strategia 1: Cerca cognome/nome nella sezione percipiente ---
     section_start = 0
     for pattern in PERCIPIENTE_SECTION_PATTERNS:
         match = pattern.search(text)
@@ -123,41 +158,68 @@ def _extract_nome_cognome(text: str) -> tuple[str, str]:
 
     search_text = text[section_start:] if section_start > 0 else text
 
-    # Cerca cognome
     cognome_match = COGNOME_PATTERN.search(search_text)
     if cognome_match:
         cognome = cognome_match.group(1).strip()
-        # Pulisci: prendi solo la prima riga (evita di catturare troppo)
         cognome = cognome.split("\n")[0].strip()
-        # Rimuovi eventuali numeri o caratteri spuri alla fine
         cognome = re.sub(r"\d.*$", "", cognome).strip()
 
-    # Cerca nome
     nome_match = NOME_PATTERN.search(search_text)
     if nome_match:
         nome = nome_match.group(1).strip()
         nome = nome.split("\n")[0].strip()
         nome = re.sub(r"\d.*$", "", nome).strip()
 
-    # Fallback: se non trovati con pattern, prova approccio posizionale
-    # Cerca il CF del percipiente e prendi le righe vicine
+    # --- Strategia 2: approccio posizionale rispetto al CF percipiente ---
     if not cognome and not nome:
         cf = _extract_percipiente_cf(text)
         if cf:
-            cf_pos = text.find(cf)
-            if cf_pos > 0:
-                # Cerca nelle righe precedenti al CF
+            # Trova la SECONDA occorrenza del CF (la prima è nella sezione header,
+            # la seconda è vicina ai dati anagrafici reali)
+            cf_positions = [m.start() for m in re.finditer(re.escape(cf), text)]
+
+            for cf_pos in cf_positions:
+                # Cerca le righe DOPO il CF: spesso cognome e nome seguono
+                after_cf = text[cf_pos + len(cf):]
+                after_lines = [l.strip() for l in after_cf.split("\n") if l.strip()]
+
+                for line in after_lines[:5]:
+                    # Riga con solo lettere maiuscole/spazi/apostrofi -> probabile cognome o nome
+                    if re.match(r"^[A-ZÀ-Ú\s\'\-]+$", line) and len(line) > 2:
+                        if not cognome:
+                            cognome = line.strip()
+                        elif not nome:
+                            nome = line.strip()
+                            break
+
+                if cognome:
+                    break
+
+                # Cerca anche prima del CF
                 before_cf = text[:cf_pos]
-                lines = [l.strip() for l in before_cf.split("\n") if l.strip()]
-                # Le ultime righe prima del CF spesso contengono cognome e nome
-                for line in reversed(lines[-5:]):
-                    # Una riga con solo lettere e spazi potrebbe essere un nome
-                    if re.match(r"^[A-ZÀ-Ú\s']+$", line) and len(line) > 2:
+                before_lines = [l.strip() for l in before_cf.split("\n") if l.strip()]
+                for line in reversed(before_lines[-5:]):
+                    if re.match(r"^[A-ZÀ-Ú\s\'\-]+$", line) and len(line) > 2:
                         parts = line.split()
                         if len(parts) >= 2 and not cognome:
                             cognome = parts[0]
                             nome = " ".join(parts[1:])
                             break
+
+                if cognome:
+                    break
+
+    # Pulizia finale
+    cognome = re.sub(r"\s{2,}", " ", cognome).strip()
+    nome = re.sub(r"\s{2,}", " ", nome).strip()
+
+    # Rimuovi valori che sono chiaramente label e non nomi
+    label_words = {"COGNOME", "NOME", "DENOMINAZIONE", "CODICE", "FISCALE",
+                   "SESSO", "DATA", "COMUNE", "PROVINCIA", "FIRMA"}
+    if cognome.upper() in label_words:
+        cognome = ""
+    if nome.upper() in label_words:
+        nome = ""
 
     return cognome.upper().strip(), nome.upper().strip()
 

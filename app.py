@@ -145,17 +145,17 @@ with tab1:
     )
 
     if uploaded_pdf is not None:
-        pdf_bytes = uploaded_pdf.read()
-        st.session_state.pdf_bytes = pdf_bytes
-
+        st.session_state.pdf_bytes = uploaded_pdf.getvalue()
         if st.button("Analizza PDF", type="primary", key="analyze_btn"):
             with st.spinner("Analisi del PDF in corso..."):
-                records = parse_pdf(pdf_bytes)
+                records = parse_pdf(st.session_state.pdf_bytes)
                 st.session_state.cu_records = records
+                st.session_state.pdf_analyzed = True
                 # Reset matching quando si carica un nuovo PDF
                 st.session_state.match_results = []
                 st.session_state.matching_confirmed = False
                 st.session_state.send_logs = []
+                st.rerun()
 
     # Mostra risultati
     records = st.session_state.cu_records
@@ -189,8 +189,15 @@ with tab1:
                 type="primary",
             )
 
-    elif uploaded_pdf is not None and st.session_state.pdf_bytes:
-        st.info("Clicca **Analizza PDF** per iniziare l'estrazione.")
+    elif st.session_state.pdf_bytes and "pdf_analyzed" in st.session_state:
+        st.error("Nessuna CU trovata nel PDF. Verifica che il PDF contenga l'intestazione 'CERTIFICAZIONE UNICA'.")
+        # Debug: mostra un estratto del testo per capire il formato
+        import fitz
+        doc = fitz.open(stream=st.session_state.pdf_bytes, filetype="pdf")
+        with st.expander(f"Debug: testo estratto dalla prima pagina ({len(doc)} pagine totali)"):
+            first_page_text = doc[0].get_text("text")
+            st.code(first_page_text[:3000])
+        doc.close()
 
 
 # ============================================================
